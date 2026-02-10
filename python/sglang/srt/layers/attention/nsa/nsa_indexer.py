@@ -4,6 +4,7 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import os
 import torch
 from einops import rearrange
 
@@ -207,7 +208,7 @@ class Indexer(MultiPlatformOp):
             max_position=max_position_embeddings,
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
+            is_neox_style=True if os.environ.get("INDEXER_ROPE_NEOX_STYLE", "1") == "1" else False,
             device=get_global_server_args().device,
         )
         self.block_size = block_size
@@ -244,6 +245,9 @@ class Indexer(MultiPlatformOp):
             x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
         weights = weights.float()
+        if weights.shape[1] < 32:
+            assert 32 % weights.shape[1] == 0
+            weights = weights.repeat_interleave(32 // weights.shape[1], dim=1)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -974,6 +978,13 @@ class Indexer(MultiPlatformOp):
                 metadata,
                 return_indices,
             )
+
+        query, key = self._get_q_k_bf16(
+            q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+        )
+        if query.shape[1] < 32:
+            assert 32 % query.shape[1] == 0
+            query = query.repeat_interleave(32//query.shape[1], dim=1)
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()

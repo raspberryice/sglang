@@ -93,7 +93,7 @@ class RMSNorm(MultiPlatformOp):
         eps: float = 1e-6,
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
-        fp32_residual: bool = False,
+        fp32_residual: bool = True,
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
@@ -170,6 +170,8 @@ class RMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
             if post_residual_addition is not None:
@@ -199,6 +201,8 @@ class RMSNorm(MultiPlatformOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             out = torch.empty_like(x)
             residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
@@ -220,15 +224,18 @@ class RMSNorm(MultiPlatformOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
+
+        if residual is not None and not self.fp32_residual:
+            x = x + residual
+            if post_residual_addition is not None:
+                x = x + post_residual_addition
+            residual = x.clone()
         x = x.to(torch.float32)
-        if residual is not None:
+        if residual is not None and self.fp32_residual:
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
                 x = x + post_residual_addition.to(torch.float32)
-            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
+            residual = x.to(orig_dtype)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
@@ -314,7 +321,7 @@ class RMSNorm(MultiPlatformOp):
 
             if get_tensor_model_parallel_world_size() > 1:
                 if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
+                    x = x + post_residual_addition
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -440,6 +447,8 @@ class GemmaRMSNorm(MultiPlatformOp):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             x = x + residual
+            if post_residual_addition is not None:
+                x = x + post_residual_addition
             residual = x
 
         x = x.float()
@@ -488,6 +497,8 @@ class GemmaRMSNorm(MultiPlatformOp):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             x = x + residual
+            if post_residual_addition is not None:
+                x = x + post_residual_addition
             residual = x
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)

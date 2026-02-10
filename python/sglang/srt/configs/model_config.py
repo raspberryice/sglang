@@ -278,6 +278,12 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV32ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
             "Glm4MoeLiteForCausalLM",
