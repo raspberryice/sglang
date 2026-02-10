@@ -611,7 +611,8 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states += shared_output
+        if shared_output is not None:
+            final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -770,6 +771,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if hidden_states.shape[0] > 0:
+            shared_event = None
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag:
@@ -777,8 +779,9 @@ class DeepseekV2MoE(nn.Module):
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(self.alt_stream)
-                        shared_event = self.alt_stream.record_event()
+                        if shared_output is not None:
+                            shared_output.record_stream(self.alt_stream)
+                            shared_event = self.alt_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -949,6 +952,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.alt_stream is not None
+            and shared_event is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
@@ -971,7 +975,11 @@ class DeepseekV2MoE(nn.Module):
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
-        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+        if (
+            hasattr(self, "shared_experts")
+            and (hidden_states.shape[0] > 0)
+            and (self.num_fused_shared_experts == 0)
+        ):
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
@@ -989,8 +997,12 @@ class DeepseekV2MoE(nn.Module):
 
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
-        if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
+        if (
+            hasattr(self, "shared_experts")
+            and (self.num_fused_shared_experts == 0)
+            and is_non_idle_and_non_empty(
+                state.forward_batch.forward_mode, hidden_states_mlp_input
+            )
         ):
             state.shared_output = self.shared_experts(hidden_states_mlp_input)
         else:
@@ -2342,10 +2354,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+        moe_layers = getattr(self.config, "moe_layers", None)
         return is_nextn or (
             self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            and (
+                layer_id in moe_layers
+                if moe_layers is not None
+                else layer_id >= self.config.first_k_dense_replace
+                and layer_id % self.config.moe_layer_freq == 0
+            )
         )
 
     def forward(
