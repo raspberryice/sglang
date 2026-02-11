@@ -51,7 +51,10 @@ class WeightChecker:
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
-        yield from self._model_runner.model.named_buffers()
+        for name, buf in self._model_runner.model.named_buffers():
+            if "cos_sin_cache" in name:
+                continue
+            yield name, buf
 
 
 def _check_tensors(
