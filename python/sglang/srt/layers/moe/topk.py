@@ -47,7 +47,10 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    get_global_experts_capturer,
+    is_expert_logging_disabled,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -1046,10 +1049,26 @@ def select_experts(
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    get_global_experts_capturer().capture(
+    capturer = get_global_experts_capturer()
+    capturer.capture(
         layer_id=layer_id,
         topk_ids=topk_ids,
     )
+
+    # Compute routing entropy from gate logits (no GPU sync — stays on device)
+    if not is_expert_logging_disabled():
+        if layer_id is not None and scoring_func is not None:
+            with torch.no_grad():
+                if scoring_func == "sigmoid":
+                    # Binary entropy per expert: H = softplus(x) + softplus(-x)
+                    rl = router_logits.float()
+                    h = torch.nn.functional.softplus(rl) + torch.nn.functional.softplus(-rl)
+                else:
+                    # Categorical entropy: H = -sum(p * log_p)
+                    log_p = torch.log_softmax(router_logits.float(), dim=-1)
+                    h = -(log_p.exp() * log_p).sum(dim=-1)
+                capturer.capture_entropy(layer_id=layer_id, entropy=h.mean())
+
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 

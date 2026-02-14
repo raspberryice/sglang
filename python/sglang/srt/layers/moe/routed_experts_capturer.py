@@ -22,11 +22,22 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
 )
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
+_disable_expert_logging = get_bool_env_var("SGLANG_DISABLE_EXPERT_LOGGING")
+
+
+def is_expert_logging_disabled() -> bool:
+    return _disable_expert_logging
+
+
+def set_expert_logging_disabled(disabled: bool):
+    global _disable_expert_logging
+    _disable_expert_logging = disabled
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
@@ -141,6 +152,9 @@ class RoutedExpertsCapturer(ABC):
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
 
+    def capture_entropy(self, layer_id: int, entropy: torch.Tensor):
+        pass
+
     def get_routed_experts(
         self,
         req_pool_idx: int,
@@ -199,6 +213,35 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 device=device,
             )
 
+        # Routing entropy tracking: per-layer running sum on GPU, logged periodically
+        self._entropy_enabled = not is_expert_logging_disabled()
+        if self._entropy_enabled:
+            self._entropy_sum = torch.zeros(self.num_hidden_layers, device=device)
+            self._entropy_window_fwd = 0  # forward passes since last log (reset on log)
+            self._entropy_total_fwd = 0   # total forward passes (never reset, for log interval)
+            self._entropy_log_interval = 500
+
+    def capture_entropy(self, layer_id: int, entropy: torch.Tensor):
+        if self._entropy_enabled and layer_id is not None:
+            self._entropy_sum[layer_id] += entropy
+
+    def _log_and_reset_entropy(self):
+        if self._entropy_window_fwd == 0:
+            return
+        means = (self._entropy_sum / self._entropy_window_fwd).cpu().tolist()
+        # Only report MoE layers (non-zero entries)
+        moe_means = {i: m for i, m in enumerate(means) if abs(m) > 1e-10}
+        if not moe_means:
+            return
+        mean_all = sum(moe_means.values()) / len(moe_means)
+        logger.info(
+            f"Routing entropy (mean over {self._entropy_window_fwd} fwd passes, "
+            f"{len(moe_means)} MoE layers): all_layers={mean_all:.4f}, "
+            f"per_layer={{{', '.join(f'{k}: {v:.4f}' for k, v in sorted(moe_means.items()))}}}"
+        )
+        self._entropy_sum.zero_()
+        self._entropy_window_fwd = 0
+
     def _sync_fwd_experts_buffer_DtoH(
         self,
         forward_batch: ForwardBatch,
@@ -251,6 +294,11 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             can_run_graph=can_run_graph,
             cuda_graph_batch=cuda_graph_batch,
         )
+        if self._entropy_enabled:
+            self._entropy_window_fwd += 1
+            self._entropy_total_fwd += 1
+            if self._entropy_total_fwd % self._entropy_log_interval == 0:
+                self._log_and_reset_entropy()
 
     def get_host_cache(self):
         return self.host_cache
