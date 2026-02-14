@@ -1,4 +1,5 @@
 import logging
+import zlib
 from abc import ABC
 from contextlib import contextmanager
 from typing import Optional
@@ -304,11 +305,11 @@ def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
 
 
 def extract_routed_experts_from_meta_info(data):
-    # To solve the performance issue, we return the experts_ids in base64
-    # We left this function for user to change it back to normal int32
+    # Routing experts are encoded as zlib-compressed int16 in base64.
     # See detokenizer_manager::_extract_routed_experts
     routed_experts_base64 = data["meta_info"].get("routed_experts", None)
     routed_experts = np.frombuffer(
-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
-    )
+        zlib.decompress(pybase64.b64decode(routed_experts_base64.encode("utf-8"))),
+        dtype=np.int16,
+    ).astype(np.int32)
     return routed_experts
