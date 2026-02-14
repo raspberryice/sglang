@@ -17,9 +17,11 @@ import dataclasses
 import logging
 import os
 import signal
+import zlib
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import psutil
 import pybase64
 import setproctitle
@@ -349,7 +351,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if recv_obj.routed_experts is not None:
             routed_experts = [
                 (
-                    pybase64.b64encode(routed_experts.numpy().tobytes()).decode("utf-8")
+                    pybase64.b64encode(
+                        zlib.compress(routed_experts.numpy().astype(np.int16).tobytes())
+                    ).decode("utf-8")
                     if routed_experts is not None
                     else None
                 )
