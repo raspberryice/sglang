@@ -1361,7 +1361,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         """Pack buffered routing data by DP rank and NCCL send to training workers.
 
-        Only TP=0 performs the NCCL send.
+        Only TP=0 performs the NCCL send.  The actual NCCL send runs in a
+        background thread so the scheduler is not blocked while waiting for
+        training workers to post their recv.
         send_plan: {str(dp_rank) → [(routing_seq_num, num_tokens), ...]}
         pending_routing: list of CPU tensors from scheduler's _pending_routing_buffer
         """
@@ -1369,11 +1371,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return True, "TP rank > 0, skipping routing transfer."
 
         try:
+            import threading
             import numpy as np
+
+            # Wait for any previous transfer to finish before starting a new one.
+            self._wait_routing_transfer()
 
             device = torch.device(self.device, self.gpu_id)
 
-            # Build all send tensors (must stay alive during coalesced send)
+            # Build all send tensors on the caller thread (CPU→GPU copy is fast
+            # and must happen before we release pending_routing references).
             send_tensors = {}
             for dp_rank_str, entries in send_plan.items():
                 dp_rank = int(dp_rank_str)
@@ -1386,20 +1393,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ).to(device=device)
                 send_tensors[dp_rank] = tensor.view(torch.int32)
 
-            # Coalesced send
-            self._routing_direct_group._start_coalescing(device)
-            for dp_rank, tensor_i32 in send_tensors.items():
-                training_rank = num_engines + dp_rank
-                self._routing_direct_group.send([tensor_i32], training_rank, 0)
-            work = self._routing_direct_group._end_coalescing(device)
-            work.wait()
+            # Coalesced NCCL send in a background thread.  The send will block
+            # until the matching recv is posted by training workers, which can
+            # take seconds (ray.put + actor dispatch).  Running on a separate
+            # thread keeps the scheduler free for forward passes.
+            def _do_send():
+                try:
+                    torch.cuda.set_device(self.gpu_id)
+                    self._routing_direct_group._start_coalescing(device)
+                    for dp_rank, tensor_i32 in send_tensors.items():
+                        training_rank = num_engines + dp_rank
+                        self._routing_direct_group.send(
+                            [tensor_i32], training_rank, 0
+                        )
+                    work = self._routing_direct_group._end_coalescing(device)
+                    work.wait()
+                except Exception as e:
+                    logger.error(f"Background routing transfer failed: {e}")
+                    self._routing_transfer_error = e
 
-            del send_tensors
-            return True, "Routing transfer completed."
+            self._routing_transfer_error = None
+            t = threading.Thread(target=_do_send, daemon=True)
+            t.start()
+            self._routing_transfer_thread = t
+
+            return True, "Routing transfer started (async)."
         except Exception as e:
             message = f"Failed routing transfer: {e}."
             logger.error(message)
             return False, message
+
+    def _wait_routing_transfer(self):
+        """Block until the previous background routing transfer completes."""
+        t = getattr(self, "_routing_transfer_thread", None)
+        if t is not None:
+            t.join()
+            self._routing_transfer_thread = None
+            err = getattr(self, "_routing_transfer_error", None)
+            if err is not None:
+                self._routing_transfer_error = None
+                raise RuntimeError(
+                    f"Previous routing transfer failed: {err}"
+                ) from err
 
     def destroy_weights_update_group(self, group_name):
         try:
