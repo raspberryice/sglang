@@ -105,11 +105,17 @@ class SchedulerOutputProcessorMixin:
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
-        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+        routing_tensor = get_global_experts_capturer().get_routed_experts(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )
+        if self.server_args.enable_direct_routing_transfer:
+            # Buffer routing data for later NCCL transfer instead of encoding into HTTP response
+            self._pending_routing_buffer.append(routing_tensor)
+            req.routing_seq_num = len(self._pending_routing_buffer) - 1
+        else:
+            req.routed_experts = routing_tensor
 
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
@@ -914,6 +920,7 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
         load = self.get_load()
         routed_experts = None
+        routing_seq_nums = None
         customized_info = {}
 
         queue_times = []
@@ -1115,9 +1122,15 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
                 if req.return_routed_experts:
-                    if routed_experts is None:
-                        routed_experts = []
-                    routed_experts.append(req.routed_experts)
+                    if self.server_args.enable_direct_routing_transfer:
+                        # In direct mode, routing data is buffered — pass seq_num instead
+                        if routing_seq_nums is None:
+                            routing_seq_nums = []
+                        routing_seq_nums.append(req.routing_seq_num)
+                    else:
+                        if routed_experts is None:
+                            routed_experts = []
+                        routed_experts.append(req.routed_experts)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1180,6 +1193,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
                     load=load,
+                    routing_seq_nums=routing_seq_nums,
                 )
             )
 

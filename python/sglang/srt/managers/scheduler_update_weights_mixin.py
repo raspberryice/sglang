@@ -23,6 +23,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    InitRoutingDirectGroupReqInput,
+    InitRoutingDirectGroupReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     PostProcessWeightsReqInput,
@@ -39,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    StartRoutingTransferReqInput,
+    StartRoutingTransferReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -68,6 +72,25 @@ class SchedulerUpdateWeightsMixin:
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
+
+    def init_routing_direct_group(
+        self: Scheduler, recv_req: InitRoutingDirectGroupReqInput
+    ):
+        """Initialize the NCCL group for direct engine→training routing transfer."""
+        success, message = self.tp_worker.init_routing_direct_group(recv_req)
+        return InitRoutingDirectGroupReqOutput(success, message)
+
+    def start_routing_transfer(
+        self: Scheduler, recv_req: StartRoutingTransferReqInput
+    ):
+        """Trigger NCCL send of buffered routing data to training workers."""
+        pending_routing = getattr(self, "_pending_routing_buffer", [])
+        success, message = self.tp_worker.start_routing_transfer(
+            recv_req, pending_routing
+        )
+        if success:
+            self._pending_routing_buffer = []
+        return StartRoutingTransferReqOutput(success, message)
 
     def destroy_weights_update_group(
         self: Scheduler, recv_req: DestroyWeightsUpdateGroupReqInput

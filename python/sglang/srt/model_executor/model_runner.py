@@ -1317,6 +1317,90 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(message)
             return False, message
 
+    def init_routing_direct_group(
+        self,
+        master_address,
+        master_port,
+        rank,
+        world_size,
+        group_name="slime-routing-direct",
+        backend="nccl",
+    ):
+        """Initialize the NCCL group for direct engine→training routing transfer.
+
+        Only TP=0 participates in the routing NCCL group. TP>0 workers are no-ops.
+        """
+        if self.tp_rank != 0:
+            return True, "TP rank > 0, skipping routing direct group init."
+
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+
+        logger.info(
+            f"init routing direct group: master_address={master_address}, master_port={master_port}, "
+            f"rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        try:
+            self._routing_direct_group = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_address}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+            )
+            return True, "Succeeded to initialize routing direct group."
+        except Exception as e:
+            message = f"Failed to initialize routing direct group: {e}."
+            logger.error(message)
+            return False, message
+
+    def start_routing_transfer(
+        self, send_plan, num_engines, num_layers, topk, pending_routing
+    ):
+        """Pack buffered routing data by DP rank and NCCL send to training workers.
+
+        Only TP=0 performs the NCCL send.
+        send_plan: {str(dp_rank) → [(routing_seq_num, num_tokens), ...]}
+        pending_routing: list of CPU tensors from scheduler's _pending_routing_buffer
+        """
+        if self.tp_rank != 0:
+            return True, "TP rank > 0, skipping routing transfer."
+
+        try:
+            import numpy as np
+
+            device = torch.device(self.device, self.gpu_id)
+
+            # Build all send tensors (must stay alive during coalesced send)
+            send_tensors = {}
+            for dp_rank_str, entries in send_plan.items():
+                dp_rank = int(dp_rank_str)
+                chunks = [pending_routing[seq_num] for seq_num, _ in entries]
+                concatenated = np.concatenate(
+                    [c.numpy() if hasattr(c, "numpy") else c for c in chunks], axis=0
+                )
+                tensor = torch.from_numpy(
+                    concatenated.astype(np.int16) if concatenated.dtype != np.int16 else concatenated
+                ).to(device=device)
+                send_tensors[dp_rank] = tensor.view(torch.int32)
+
+            # Coalesced send
+            self._routing_direct_group._start_coalescing(device)
+            for dp_rank, tensor_i32 in send_tensors.items():
+                training_rank = num_engines + dp_rank
+                self._routing_direct_group.send([tensor_i32], training_rank, 0)
+            work = self._routing_direct_group._end_coalescing(device)
+            work.wait()
+
+            del send_tensors
+            return True, "Routing transfer completed."
+        except Exception as e:
+            message = f"Failed routing transfer: {e}."
+            logger.error(message)
+            return False, message
+
     def destroy_weights_update_group(self, group_name):
         try:
             if group_name in self._model_update_group:

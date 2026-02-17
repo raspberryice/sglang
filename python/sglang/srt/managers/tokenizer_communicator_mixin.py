@@ -49,6 +49,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
+    InitRoutingDirectGroupReqInput,
+    InitRoutingDirectGroupReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -68,6 +70,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    StartRoutingTransferReqInput,
+    StartRoutingTransferReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -169,6 +173,12 @@ class TokenizerCommunicatorMixin:
         self.init_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.init_routing_direct_group_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.start_routing_transfer_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.destroy_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -247,6 +257,14 @@ class TokenizerCommunicatorMixin:
                 (
                     InitWeightsUpdateGroupReqOutput,
                     self.init_weights_update_group_communicator.handle_recv,
+                ),
+                (
+                    InitRoutingDirectGroupReqOutput,
+                    self.init_routing_direct_group_communicator.handle_recv,
+                ),
+                (
+                    StartRoutingTransferReqOutput,
+                    self.start_routing_transfer_communicator.handle_recv,
                 ),
                 (
                     DestroyWeightsUpdateGroupReqOutput,
@@ -477,6 +495,24 @@ class TokenizerCommunicatorMixin:
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.init_weights_update_group_communicator(obj)
+        return _Communicator.merge_results(results)
+
+    async def init_routing_direct_group(
+        self: TokenizerManager,
+        obj: InitRoutingDirectGroupReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        results = await self.init_routing_direct_group_communicator(obj)
+        return _Communicator.merge_results(results)
+
+    async def start_routing_transfer(
+        self: TokenizerManager,
+        obj: StartRoutingTransferReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        results = await self.start_routing_transfer_communicator(obj)
         return _Communicator.merge_results(results)
 
     async def destroy_weights_update_group(
