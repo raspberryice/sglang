@@ -131,6 +131,10 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    def execute_routing_transfer(self):
+        success, message = self.model_runner.execute_routing_transfer()
+        return success, message
+
     def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
         success, message = self.model_runner.destroy_weights_update_group(
             recv_req.group_name,

@@ -1497,6 +1497,17 @@ class StartRoutingTransferReqOutput(BaseReq):
 
 
 @dataclass
+class ExecuteRoutingTransferReqInput(BaseReq):
+    pass  # No fields needed — data was staged by start_routing_transfer
+
+
+@dataclass
+class ExecuteRoutingTransferReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class DestroyWeightsUpdateGroupReqInput(BaseReq):
     group_name: str = "weight_update_group"
 

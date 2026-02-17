@@ -119,6 +119,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     StartRoutingTransferReqInput,
+    ExecuteRoutingTransferReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -1046,6 +1047,7 @@ class Scheduler(
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (InitRoutingDirectGroupReqInput, self.init_routing_direct_group),
                 (StartRoutingTransferReqInput, self.start_routing_transfer),
+                (ExecuteRoutingTransferReqInput, self.execute_routing_transfer),
                 (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,

@@ -117,6 +117,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     StartRoutingTransferReqInput,
+    ExecuteRoutingTransferReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
@@ -1008,6 +1009,21 @@ async def start_routing_transfer(
 ):
     """Trigger NCCL send of buffered routing data to training workers."""
     success, message = await _global_state.tokenizer_manager.start_routing_transfer(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/execute_routing_transfer")
+async def execute_routing_transfer(
+    obj: ExecuteRoutingTransferReqInput, request: Request
+):
+    """Execute NCCL send from previously staged routing data."""
+    success, message = await _global_state.tokenizer_manager.execute_routing_transfer(
         obj, request
     )
     content = {"success": success, "message": message}

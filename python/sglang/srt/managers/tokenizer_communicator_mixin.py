@@ -72,6 +72,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     StartRoutingTransferReqInput,
     StartRoutingTransferReqOutput,
+    ExecuteRoutingTransferReqInput,
+    ExecuteRoutingTransferReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -179,6 +181,9 @@ class TokenizerCommunicatorMixin:
         self.start_routing_transfer_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.execute_routing_transfer_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.destroy_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -265,6 +270,10 @@ class TokenizerCommunicatorMixin:
                 (
                     StartRoutingTransferReqOutput,
                     self.start_routing_transfer_communicator.handle_recv,
+                ),
+                (
+                    ExecuteRoutingTransferReqOutput,
+                    self.execute_routing_transfer_communicator.handle_recv,
                 ),
                 (
                     DestroyWeightsUpdateGroupReqOutput,
@@ -513,6 +522,15 @@ class TokenizerCommunicatorMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         results = await self.start_routing_transfer_communicator(obj)
+        return _Communicator.merge_results(results)
+
+    async def execute_routing_transfer(
+        self: TokenizerManager,
+        obj: ExecuteRoutingTransferReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        results = await self.execute_routing_transfer_communicator(obj)
         return _Communicator.merge_results(results)
 
     async def destroy_weights_update_group(

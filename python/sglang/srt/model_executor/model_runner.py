@@ -1359,11 +1359,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def start_routing_transfer(
         self, send_plan, num_engines, num_layers, topk, pending_routing
     ):
-        """Pack buffered routing data by DP rank and NCCL send to training workers.
+        """Stage routing data on GPU for later NCCL send (two-phase protocol).
 
-        Only TP=0 performs the NCCL send.  The actual NCCL send runs in a
-        background thread so the scheduler is not blocked while waiting for
-        training workers to post their recv.
+        Phase 1 (this method): pack buffered routing data by DP rank and copy
+        to GPU.  No NCCL ops — the scheduler thread returns immediately and
+        can continue serving forward batches.
+
+        Phase 2 (execute_routing_transfer): called later when training workers
+        are about to post their recv, so the NCCL send completes in ~1s
+        instead of blocking for minutes.
+
         send_plan: {str(dp_rank) → [(routing_seq_num, num_tokens), ...]}
         pending_routing: list of CPU tensors from scheduler's _pending_routing_buffer
         """
@@ -1371,13 +1376,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return True, "TP rank > 0, skipping routing transfer."
 
         try:
-            import threading
             import numpy as np
 
             device = torch.device(self.device, self.gpu_id)
 
-            # Build all send tensors on the caller thread (CPU→GPU copy is fast
-            # and must happen before we release pending_routing references).
             send_tensors = {}
             for dp_rank_str, entries in send_plan.items():
                 dp_rank = int(dp_rank_str)
@@ -1390,54 +1392,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ).to(device=device)
                 send_tensors[dp_rank] = tensor.view(torch.int32)
 
-            # Record an event on the default stream so the background send
-            # stream can wait for the CPU→GPU copies to finish.
-            tensor_ready = torch.cuda.Event()
-            tensor_ready.record()
-
-            # Coalesced NCCL send in a background thread.  The send blocks
-            # until the matching recv is posted by training workers, which can
-            # take minutes in async mode (training busy with previous step).
-            # The new thread joins the previous thread before starting its own
-            # send, so sends are serialized but the scheduler is never blocked.
-            #
-            # IMPORTANT: the NCCL ops run on a dedicated CUDA stream, NOT the
-            # default stream.  work.wait() calls synchronizeStream() which
-            # makes the "current stream" wait for the NCCL work stream.  If
-            # we used the default stream, the scheduler's forward passes
-            # (which also run on stream 0) would be blocked, deadlocking TP.
-            prev_thread = getattr(self, "_routing_transfer_thread", None)
-
-            def _do_send():
-                try:
-                    torch.cuda.set_device(self.gpu_id)
-                    # Serialize with previous transfer (in background, not on
-                    # the scheduler thread).
-                    if prev_thread is not None:
-                        prev_thread.join()
-                    # Dedicated stream: work.wait() only poisons this stream,
-                    # not the default stream used by the scheduler.
-                    send_stream = torch.cuda.Stream(device=device)
-                    send_stream.wait_event(tensor_ready)
-                    with torch.cuda.stream(send_stream):
-                        self._routing_direct_group._start_coalescing(device)
-                        for dp_rank, tensor_i32 in send_tensors.items():
-                            training_rank = num_engines + dp_rank
-                            self._routing_direct_group.send(
-                                [tensor_i32], training_rank, 0
-                            )
-                        work = self._routing_direct_group._end_coalescing(device)
-                        work.wait()
-                except Exception as e:
-                    logger.error(f"Background routing transfer failed: {e}")
-
-            t = threading.Thread(target=_do_send, daemon=True)
-            t.start()
-            self._routing_transfer_thread = t
-
-            return True, "Routing transfer started (async)."
+            self._staged_routing_send = (send_tensors, device, num_engines)
+            return True, "Routing data staged on GPU."
         except Exception as e:
-            message = f"Failed routing transfer: {e}."
+            message = f"Failed to stage routing transfer: {e}."
+            logger.error(message)
+            return False, message
+
+    def execute_routing_transfer(self):
+        """Execute NCCL coalesced send from previously staged data (phase 2).
+
+        Called by the training side (via HTTP) just before posting recv, so
+        the send/recv are matched in time and complete quickly (~1s).  This
+        avoids long-pending NCCL P2P send kernels that would spin-wait on
+        GPU SMs and block TP collectives in forward passes.
+        """
+        if self.tp_rank != 0:
+            return True, "TP rank > 0, skipping routing transfer."
+
+        staged = getattr(self, "_staged_routing_send", None)
+        if staged is None:
+            # Idempotent: multiple DP ranks may trigger execute on the same
+            # engine, but the first call already sent to all DP ranks via
+            # coalesced NCCL send.  Subsequent calls are no-ops.
+            return True, "Already executed (idempotent)."
+
+        try:
+            send_tensors, device, num_engines = staged
+            self._staged_routing_send = None
+
+            self._routing_direct_group._start_coalescing(device)
+            for dp_rank, tensor_i32 in send_tensors.items():
+                training_rank = num_engines + dp_rank
+                self._routing_direct_group.send(
+                    [tensor_i32], training_rank, 0
+                )
+            work = self._routing_direct_group._end_coalescing(device)
+            work.wait()
+
+            del send_tensors
+            return True, "Routing transfer completed."
+        except Exception as e:
+            message = f"Failed routing transfer execute: {e}."
             logger.error(message)
             return False, message
 

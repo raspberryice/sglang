@@ -43,6 +43,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     StartRoutingTransferReqInput,
     StartRoutingTransferReqOutput,
+    ExecuteRoutingTransferReqInput,
+    ExecuteRoutingTransferReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -83,7 +85,7 @@ class SchedulerUpdateWeightsMixin:
     def start_routing_transfer(
         self: Scheduler, recv_req: StartRoutingTransferReqInput
     ):
-        """Trigger NCCL send of buffered routing data to training workers."""
+        """Stage buffered routing data on GPU for later NCCL send (phase 1)."""
         pending_routing = getattr(self, "_pending_routing_buffer", [])
         success, message = self.tp_worker.start_routing_transfer(
             recv_req, pending_routing
@@ -91,6 +93,13 @@ class SchedulerUpdateWeightsMixin:
         if success:
             self._pending_routing_buffer = []
         return StartRoutingTransferReqOutput(success, message)
+
+    def execute_routing_transfer(
+        self: Scheduler, recv_req: ExecuteRoutingTransferReqInput
+    ):
+        """Execute NCCL send from previously staged routing data (phase 2)."""
+        success, message = self.tp_worker.execute_routing_transfer()
+        return ExecuteRoutingTransferReqOutput(success, message)
 
     def destroy_weights_update_group(
         self: Scheduler, recv_req: DestroyWeightsUpdateGroupReqInput
