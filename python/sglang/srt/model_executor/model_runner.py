@@ -1374,9 +1374,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             import threading
             import numpy as np
 
-            # Wait for any previous transfer to finish before starting a new one.
-            self._wait_routing_transfer()
-
             device = torch.device(self.device, self.gpu_id)
 
             # Build all send tensors on the caller thread (CPU→GPU copy is fast
@@ -1393,13 +1390,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ).to(device=device)
                 send_tensors[dp_rank] = tensor.view(torch.int32)
 
-            # Coalesced NCCL send in a background thread.  The send will block
+            # Coalesced NCCL send in a background thread.  The send blocks
             # until the matching recv is posted by training workers, which can
-            # take seconds (ray.put + actor dispatch).  Running on a separate
-            # thread keeps the scheduler free for forward passes.
+            # take minutes in async mode (training busy with previous step).
+            # The new thread joins the previous thread before starting its own
+            # send, so sends are serialized but the scheduler is never blocked.
+            prev_thread = getattr(self, "_routing_transfer_thread", None)
+
             def _do_send():
                 try:
                     torch.cuda.set_device(self.gpu_id)
+                    # Serialize with previous transfer (in background, not on
+                    # the scheduler thread — this is the key difference).
+                    if prev_thread is not None:
+                        prev_thread.join()
                     self._routing_direct_group._start_coalescing(device)
                     for dp_rank, tensor_i32 in send_tensors.items():
                         training_rank = num_engines + dp_rank
@@ -1410,9 +1414,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     work.wait()
                 except Exception as e:
                     logger.error(f"Background routing transfer failed: {e}")
-                    self._routing_transfer_error = e
 
-            self._routing_transfer_error = None
             t = threading.Thread(target=_do_send, daemon=True)
             t.start()
             self._routing_transfer_thread = t
@@ -1422,19 +1424,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             message = f"Failed routing transfer: {e}."
             logger.error(message)
             return False, message
-
-    def _wait_routing_transfer(self):
-        """Block until the previous background routing transfer completes."""
-        t = getattr(self, "_routing_transfer_thread", None)
-        if t is not None:
-            t.join()
-            self._routing_transfer_thread = None
-            err = getattr(self, "_routing_transfer_error", None)
-            if err is not None:
-                self._routing_transfer_error = None
-                raise RuntimeError(
-                    f"Previous routing transfer failed: {err}"
-                ) from err
 
     def destroy_weights_update_group(self, group_name):
         try:
