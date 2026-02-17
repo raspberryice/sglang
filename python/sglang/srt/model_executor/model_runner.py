@@ -1390,28 +1390,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ).to(device=device)
                 send_tensors[dp_rank] = tensor.view(torch.int32)
 
+            # Record an event on the default stream so the background send
+            # stream can wait for the CPU→GPU copies to finish.
+            tensor_ready = torch.cuda.Event()
+            tensor_ready.record()
+
             # Coalesced NCCL send in a background thread.  The send blocks
             # until the matching recv is posted by training workers, which can
             # take minutes in async mode (training busy with previous step).
             # The new thread joins the previous thread before starting its own
             # send, so sends are serialized but the scheduler is never blocked.
+            #
+            # IMPORTANT: the NCCL ops run on a dedicated CUDA stream, NOT the
+            # default stream.  work.wait() calls synchronizeStream() which
+            # makes the "current stream" wait for the NCCL work stream.  If
+            # we used the default stream, the scheduler's forward passes
+            # (which also run on stream 0) would be blocked, deadlocking TP.
             prev_thread = getattr(self, "_routing_transfer_thread", None)
 
             def _do_send():
                 try:
                     torch.cuda.set_device(self.gpu_id)
                     # Serialize with previous transfer (in background, not on
-                    # the scheduler thread — this is the key difference).
+                    # the scheduler thread).
                     if prev_thread is not None:
                         prev_thread.join()
-                    self._routing_direct_group._start_coalescing(device)
-                    for dp_rank, tensor_i32 in send_tensors.items():
-                        training_rank = num_engines + dp_rank
-                        self._routing_direct_group.send(
-                            [tensor_i32], training_rank, 0
-                        )
-                    work = self._routing_direct_group._end_coalescing(device)
-                    work.wait()
+                    # Dedicated stream: work.wait() only poisons this stream,
+                    # not the default stream used by the scheduler.
+                    send_stream = torch.cuda.Stream(device=device)
+                    send_stream.wait_event(tensor_ready)
+                    with torch.cuda.stream(send_stream):
+                        self._routing_direct_group._start_coalescing(device)
+                        for dp_rank, tensor_i32 in send_tensors.items():
+                            training_rank = num_engines + dp_rank
+                            self._routing_direct_group.send(
+                                [tensor_i32], training_rank, 0
+                            )
+                        work = self._routing_direct_group._end_coalescing(device)
+                        work.wait()
                 except Exception as e:
                     logger.error(f"Background routing transfer failed: {e}")
 
