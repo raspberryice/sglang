@@ -1544,10 +1544,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.routed_experts[i]
-            if getattr(recv_obj, "routing_seq_nums", None):
-                meta_info["routing_seq_num"] = recv_obj.routing_seq_nums[i]
-            if self.server_args.engine_id is not None:
-                meta_info["engine_id"] = self.server_args.engine_id
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]

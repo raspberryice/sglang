@@ -1040,9 +1040,6 @@ class BatchTokenIDOutput(
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
-    # Direct routing transfer: seq nums for buffered routing data
-    routing_seq_nums: Optional[List[int]] = None
-
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -1133,9 +1130,6 @@ class BatchStrOutput(
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
-
-    # Direct routing transfer: seq nums for buffered routing data
-    routing_seq_nums: Optional[List[int]] = None
 
 
 @dataclass
@@ -1462,47 +1456,6 @@ class InitWeightsUpdateGroupReqInput(BaseReq):
 
 @dataclass
 class InitWeightsUpdateGroupReqOutput(BaseReq):
-    success: bool
-    message: str
-
-
-@dataclass
-class InitRoutingDirectGroupReqInput(BaseReq):
-    master_address: str
-    master_port: int
-    rank: int
-    world_size: int
-    group_name: str = "slime-routing-direct"
-    backend: str = "nccl"
-
-
-@dataclass
-class InitRoutingDirectGroupReqOutput(BaseReq):
-    success: bool
-    message: str
-
-
-@dataclass
-class StartRoutingTransferReqInput(BaseReq):
-    send_plan: dict  # {dp_rank → [(routing_seq_num, num_tokens), ...]}
-    num_engines: int
-    num_layers: int
-    topk: int
-
-
-@dataclass
-class StartRoutingTransferReqOutput(BaseReq):
-    success: bool
-    message: str
-
-
-@dataclass
-class ExecuteRoutingTransferReqInput(BaseReq):
-    pass  # No fields needed — data was staged by start_routing_transfer
-
-
-@dataclass
-class ExecuteRoutingTransferReqOutput(BaseReq):
     success: bool
     message: str
 

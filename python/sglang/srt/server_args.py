@@ -698,10 +698,6 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
-    # Direct routing transfer (RLHF routing replay)
-    engine_id: Optional[int] = None
-    enable_direct_routing_transfer: bool = False
-
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.

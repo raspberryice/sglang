@@ -103,7 +103,6 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
-    InitRoutingDirectGroupReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
@@ -116,8 +115,6 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
-    StartRoutingTransferReqInput,
-    ExecuteRoutingTransferReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
@@ -979,51 +976,6 @@ async def init_weights_update_group(
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
-        obj, request
-    )
-    content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
-
-
-@app.post("/init_routing_direct_group")
-async def init_routing_direct_group(
-    obj: InitRoutingDirectGroupReqInput, request: Request
-):
-    """Initialize the NCCL group for direct engine→training routing transfer."""
-    success, message = await _global_state.tokenizer_manager.init_routing_direct_group(
-        obj, request
-    )
-    content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
-
-
-@app.post("/start_routing_transfer")
-async def start_routing_transfer(
-    obj: StartRoutingTransferReqInput, request: Request
-):
-    """Trigger NCCL send of buffered routing data to training workers."""
-    success, message = await _global_state.tokenizer_manager.start_routing_transfer(
-        obj, request
-    )
-    content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
-
-
-@app.post("/execute_routing_transfer")
-async def execute_routing_transfer(
-    obj: ExecuteRoutingTransferReqInput, request: Request
-):
-    """Execute NCCL send from previously staged routing data."""
-    success, message = await _global_state.tokenizer_manager.execute_routing_transfer(
         obj, request
     )
     content = {"success": success, "message": message}

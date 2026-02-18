@@ -110,31 +110,6 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def init_routing_direct_group(self, recv_req):
-        success, message = self.model_runner.init_routing_direct_group(
-            recv_req.master_address,
-            recv_req.master_port,
-            recv_req.rank,
-            recv_req.world_size,
-            recv_req.group_name,
-            recv_req.backend,
-        )
-        return success, message
-
-    def start_routing_transfer(self, recv_req, pending_routing):
-        success, message = self.model_runner.start_routing_transfer(
-            recv_req.send_plan,
-            recv_req.num_engines,
-            recv_req.num_layers,
-            recv_req.topk,
-            pending_routing,
-        )
-        return success, message
-
-    def execute_routing_transfer(self):
-        success, message = self.model_runner.execute_routing_transfer()
-        return success, message
-
     def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
         success, message = self.model_runner.destroy_weights_update_group(
             recv_req.group_name,

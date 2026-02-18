@@ -101,7 +101,6 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
-    InitRoutingDirectGroupReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
@@ -118,8 +117,6 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
-    StartRoutingTransferReqInput,
-    ExecuteRoutingTransferReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -407,10 +404,6 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
-
-        # Init direct routing transfer buffer
-        if self.server_args.enable_direct_routing_transfer:
-            self._pending_routing_buffer = []
 
         self.is_initializing = False
 
@@ -1045,9 +1038,6 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
-                (InitRoutingDirectGroupReqInput, self.init_routing_direct_group),
-                (StartRoutingTransferReqInput, self.start_routing_transfer),
-                (ExecuteRoutingTransferReqInput, self.execute_routing_transfer),
                 (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,

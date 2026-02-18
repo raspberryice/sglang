@@ -739,8 +739,6 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
-        # Index into scheduler._pending_routing_buffer (for direct routing transfer)
-        self.routing_seq_num: Optional[int] = None
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
