@@ -1359,21 +1359,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def start_routing_transfer(
         self, send_plan, num_engines, num_layers, topk, pending_routing
     ):
-        """Stage routing data on GPU for later NCCL send (two-phase protocol).
+        """Stage routing data on GPU and fire NCCL send (single-phase fire-and-forget).
 
-        Phase 1 (this method): pack buffered routing data by DP rank and copy
-        to GPU.  No NCCL ops — the scheduler thread returns immediately and
-        can continue serving forward batches.
+        Packs buffered routing data by DP rank, copies to GPU, and immediately
+        fires a coalesced NCCL send.  No work.wait() — the NCCL send runs on
+        the internal work stream and the scheduler thread returns immediately.
 
-        Phase 2 (execute_routing_transfer): called later when training workers
-        are about to post their recv, so the NCCL send completes in ~1s
-        instead of blocking for minutes.
+        The training side posts recv independently; NCCL matches send/recv in
+        FIFO order.  Previous in-flight sends are cleaned up non-blockingly.
 
         send_plan: {str(dp_rank) → [(routing_seq_num, num_tokens), ...]}
         pending_routing: list of CPU tensors from scheduler's _pending_routing_buffer
         """
         if self.tp_rank != 0:
             return True, "TP rank > 0, skipping routing transfer."
+
+        # Non-blocking cleanup: drain completed sends from previous steps.
+        # Never call work.wait() — that would CPU-block the scheduler thread.
+        pending_sends = getattr(self, "_routing_pending_sends", None)
+        if pending_sends is None:
+            from collections import deque
+            self._routing_pending_sends = deque()
+            pending_sends = self._routing_pending_sends
+        while pending_sends and pending_sends[0][0].is_completed():
+            pending_sends.popleft()
 
         try:
             import numpy as np
@@ -1392,35 +1401,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ).to(device=device)
                 send_tensors[dp_rank] = tensor.view(torch.int32)
 
-            self._staged_routing_send = (send_tensors, device, num_engines)
-            return True, "Routing data staged on GPU."
-        except Exception as e:
-            message = f"Failed to stage routing transfer: {e}."
-            logger.error(message)
-            return False, message
-
-    def execute_routing_transfer(self):
-        """Execute NCCL coalesced send from previously staged data (phase 2).
-
-        Called by the training side (via HTTP) just before posting recv, so
-        the send/recv are matched in time and complete quickly (~1s).  This
-        avoids long-pending NCCL P2P send kernels that would spin-wait on
-        GPU SMs and block TP collectives in forward passes.
-        """
-        if self.tp_rank != 0:
-            return True, "TP rank > 0, skipping routing transfer."
-
-        staged = getattr(self, "_staged_routing_send", None)
-        if staged is None:
-            # Idempotent: multiple DP ranks may trigger execute on the same
-            # engine, but the first call already sent to all DP ranks via
-            # coalesced NCCL send.  Subsequent calls are no-ops.
-            return True, "Already executed (idempotent)."
-
-        try:
-            send_tensors, device, num_engines = staged
-            self._staged_routing_send = None
-
+            # Fire coalesced NCCL send — fire-and-forget.
+            # NCCL send kernel runs on the internal work stream, separate from
+            # the default CUDA stream.  The scheduler thread is never blocked.
             self._routing_direct_group._start_coalescing(device)
             for dp_rank, tensor_i32 in send_tensors.items():
                 training_rank = num_engines + dp_rank
@@ -1428,14 +1411,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     [tensor_i32], training_rank, 0
                 )
             work = self._routing_direct_group._end_coalescing(device)
-            work.wait()
 
-            del send_tensors
-            return True, "Routing transfer completed."
+            # Stash work handle + tensors to prevent deallocation while
+            # NCCL is in-flight.  Cleaned up non-blockingly on next call.
+            pending_sends.append((work, send_tensors))
+
+            return True, "Routing transfer sent (fire-and-forget)."
         except Exception as e:
-            message = f"Failed routing transfer execute: {e}."
+            message = f"Failed routing transfer: {e}."
             logger.error(message)
             return False, message
+
+    def execute_routing_transfer(self):
+        """No-op, kept for backwards compatibility.
+
+        Previously phase 2 of a two-phase protocol.  Now start_routing_transfer
+        handles both staging and NCCL send in a single fire-and-forget call.
+        """
+        return True, "No-op (single-phase protocol)."
 
     def destroy_weights_update_group(self, group_name):
         try:

@@ -85,7 +85,7 @@ class SchedulerUpdateWeightsMixin:
     def start_routing_transfer(
         self: Scheduler, recv_req: StartRoutingTransferReqInput
     ):
-        """Stage buffered routing data on GPU for later NCCL send (phase 1)."""
+        """Stage buffered routing data on GPU and fire NCCL send (fire-and-forget)."""
         pending_routing = getattr(self, "_pending_routing_buffer", [])
         success, message = self.tp_worker.start_routing_transfer(
             recv_req, pending_routing
@@ -97,7 +97,7 @@ class SchedulerUpdateWeightsMixin:
     def execute_routing_transfer(
         self: Scheduler, recv_req: ExecuteRoutingTransferReqInput
     ):
-        """Execute NCCL send from previously staged routing data (phase 2)."""
+        """No-op, kept for backwards compatibility (single-phase protocol)."""
         success, message = self.tp_worker.execute_routing_transfer()
         return ExecuteRoutingTransferReqOutput(success, message)
 
