@@ -532,6 +532,7 @@ class Req(ReqDllmMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -736,8 +737,13 @@ class Req(ReqDllmMixin):
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
+        # Routing for positions [routed_experts_start_len, seqlen - 1) is
+        # returned. Default 0 preserves the historical "all positions" behavior;
+        # multi-turn agent rollouts set this to the cumulative prior length to
+        # avoid resending overlapping prefixes (O(N²) wire cost).
+        self.routed_experts_start_len: int = routed_experts_start_len
         self.routed_experts: Optional[torch.Tensor] = (
-            None  # cpu tensor: shape (seqlen, topk)
+            None  # cpu tensor: shape (seqlen - start_len - 1, num_layers, topk)
         )
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
