@@ -976,6 +976,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                routed_experts_start_len=obj.routed_experts_start_len,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -1592,7 +1593,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if getattr(recv_obj, "routed_experts", None):
+            # When the request asked for routed_experts, always set the key
+            # (possibly to None) so clients don't crash on idle/retraction
+            # batches where recv_obj.routed_experts is None or shorter than
+            # the batch.
+            if getattr(state.obj, "return_routed_experts", False):
+                re_list = getattr(recv_obj, "routed_experts", None)
+                routed_experts_tensor = (
+                    re_list[i]
+                    if re_list is not None and i < len(re_list)
+                    else None
+                )
+                if routed_experts_tensor is not None:
+                    meta_info["routed_experts"] = pybase64.b64encode(
+                        zlib.compress(
+                            routed_experts_tensor.numpy().astype(np.int16).tobytes()
+                        )
+                    ).decode("utf-8")
+                else:
+                    meta_info["routed_experts"] = None
+            elif getattr(recv_obj, "routed_experts", None):
                 routed_experts_tensor = recv_obj.routed_experts[i]
                 if routed_experts_tensor is not None:
                     meta_info["routed_experts"] = pybase64.b64encode(

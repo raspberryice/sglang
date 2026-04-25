@@ -140,6 +140,7 @@ class RoutedExpertsCapturer(ABC):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ):
         raise NotImplementedError
 
@@ -214,9 +215,15 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ):
+        end = seqlen - 1
+        # Defensive clamp — caller guarantees 0 <= start_len <= seqlen, but a
+        # stale prefix length (e.g. session reuse mishap) shouldn't slice past
+        # the end. Slicing past end yields an empty tensor naturally.
+        start_len = max(0, min(start_len, end))
         cache_pool_idx = (
-            req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
+            req_to_token_pool.req_to_token[req_pool_idx][start_len:end].cpu().clone()
         )
         return self.get_host_cache().buffer[cache_pool_idx]
 
@@ -254,6 +261,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ):
         pass
 

@@ -100,6 +100,7 @@ class SchedulerOutputProcessorMixin:
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            start_len=req.routed_experts_start_len,
         )
 
     def maybe_collect_customized_info(

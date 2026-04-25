@@ -625,6 +625,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            routed_experts_start_len=self.routed_experts_start_len,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
