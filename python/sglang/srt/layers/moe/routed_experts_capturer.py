@@ -222,6 +222,52 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             self._entropy_total_fwd = 0   # total forward passes (never reset, for log interval)
             self._entropy_log_interval = 500
 
+        # Async D→H copy state (cherry-picked from Relax's routing_replay_patch).
+        # Eliminates the per-step cudaStreamSynchronize that breaks SGLang's overlap
+        # scheduler. See design/relax_comparison.md §2 and
+        # posts/data_transfer_patterns.md §2 for context.
+        dev_buf = self.device_cache.buffer
+        topk = self.num_experts_per_tok
+
+        # GPU staging buffer — same shape as device_cache.buffer; never overwritten
+        # by capture(), so it's safe to read on the copy stream after the snapshot.
+        self._staging_buffer = torch.zeros_like(dev_buf)
+
+        # CPU pinned staging for routing data (topk slice only — no fused shared
+        # experts, matching the host_cache layout).
+        self._pinned_staging = torch.zeros(
+            (dev_buf.shape[0], dev_buf.shape[1], topk),
+            dtype=dev_buf.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+        # CPU pinned buffer for out_cache_loc indices. int64 to absorb any dtype
+        # of forward_batch.out_cache_loc on the GPU side.
+        max_batch = dev_buf.shape[0]
+        self._pinned_loc = torch.zeros(
+            max_batch, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+
+        # Dedicated copy stream + event for the async D→H pipeline.
+        self._copy_stream = torch.cuda.Stream(device=dev_buf.device)
+        self._copy_event = torch.cuda.Event()
+
+        # Pending scatter state. 0 means nothing pending.
+        self._pending_n = 0
+
+        staging_mb = (
+            self._staging_buffer.nelement() * self._staging_buffer.element_size()
+        ) / _MB
+        pinned_mb = (
+            self._pinned_staging.nelement() * self._pinned_staging.element_size()
+        ) / _MB
+        logger.info(
+            "Routing-replay async D→H: GPU staging %.2f MB, CPU pinned staging %.2f MB",
+            staging_mb,
+            pinned_mb,
+        )
+
     def capture_entropy(self, layer_id: int, entropy: torch.Tensor):
         if self._entropy_enabled and layer_id is not None:
             self._entropy_sum[layer_id] += entropy
@@ -263,11 +309,54 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             local_start_pos = 0
             local_end_pos = forward_batch.out_cache_loc.shape[0]
 
-        # FIXME: sync explicitly here, overlap scheduler breaks here.
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
-        self.host_cache.buffer[out_cache_loc_cpu] = self.device_cache.buffer[
-            local_start_pos:local_end_pos, :, : self.num_experts_per_tok
-        ].cpu()
+        n_tok = local_end_pos - local_start_pos
+        topk = self.num_experts_per_tok
+
+        # Flush previous pending scatter so pinned buffers can be reused.
+        self._flush_pending_scatter()
+
+        # Capture the active stream BEFORE entering the copy-stream context. In
+        # overlap-scheduler mode this is forward_stream; without overlap it is the
+        # default stream. The copy stream needs to wait on this so the GPU→GPU
+        # snapshot below completes before being read.
+        active_stream = torch.cuda.current_stream(self.device_cache.buffer.device)
+
+        # 1) GPU→GPU snapshot on the active stream — fast, no sync.
+        self._staging_buffer[:n_tok].copy_(
+            self.device_cache.buffer[local_start_pos:local_end_pos]
+        )
+
+        # 2) On copy stream: async copies to pinned CPU buffers.
+        with torch.cuda.stream(self._copy_stream):
+            self._copy_stream.wait_stream(active_stream)
+            self._pinned_staging[:n_tok, :, :topk].copy_(
+                self._staging_buffer[:n_tok, :, :topk], non_blocking=True
+            )
+            self._pinned_loc[:n_tok].copy_(
+                forward_batch.out_cache_loc, non_blocking=True
+            )
+
+        # 3) Record event — no sync, returns immediately.
+        self._copy_event.record(self._copy_stream)
+
+        # 4) Mark pending; scatter happens at next flush.
+        self._pending_n = n_tok
+
+    def _flush_pending_scatter(self):
+        """Synchronize pending async copy and scatter pinned data into host_cache.
+
+        Called at the start of the next _sync_fwd_experts_buffer_DtoH (so pinned
+        buffers can be reused) and at the start of get_routed_experts (so the
+        host_cache read sees the latest data).
+        """
+        if self._pending_n == 0:
+            return
+        self._copy_event.synchronize()
+        n = self._pending_n
+        topk = self.num_experts_per_tok
+        loc = self._pinned_loc[:n]
+        self.host_cache.buffer[loc] = self._pinned_staging[:n, :, :topk]
+        self._pending_n = 0
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         if get_moe_a2a_backend().is_deepep():
@@ -285,6 +374,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
     ):
+        # Ensure the most recent async D→H copy has landed in host_cache before reading.
+        self._flush_pending_scatter()
+
         end = seqlen - 1
         # Defensive clamp — caller guarantees 0 <= start_len <= seqlen, but a
         # stale prefix length (e.g. session reuse mishap) shouldn't slice past
