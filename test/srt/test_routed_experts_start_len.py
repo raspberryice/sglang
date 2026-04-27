@@ -32,6 +32,9 @@ def _make_capturer(num_tokens: int, num_layers: int, top_k: int) -> _RoutedExper
             for k in range(top_k):
                 host_cache.buffer[i, layer, k] = i * 1000 + layer * 10 + k
     cap.host_cache = host_cache
+    # get_routed_experts calls _flush_pending_scatter() first; with _pending_n=0
+    # the flush is a no-op and the slicing path runs unchanged.
+    cap._pending_n = 0
     return cap
 
 
