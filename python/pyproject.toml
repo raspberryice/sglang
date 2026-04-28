@@ -71,7 +71,9 @@ dependencies = [
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision",
   "tqdm",
-  "transformers==4.57.1",
+  # Bumped from `==4.57.1` to allow transformers 5.x for Qwen3.5 typed-config
+  # support (`Qwen3_5MoeTextConfig.layer_types`). Verified working with 5.7.0.
+  "transformers>=4.57.1",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",

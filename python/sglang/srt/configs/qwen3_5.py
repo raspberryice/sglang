@@ -8,6 +8,9 @@ class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
 
 class Qwen3_5TextConfig(Qwen3NextConfig):
     model_type = "qwen3_5_text"
@@ -109,14 +112,32 @@ class Qwen3_5Config(PretrainedConfig):
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
     model_type = "qwen3_5_moe"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
 
 class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
     model_type = "qwen3_5_moe_text"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
+
+# All Moe variant classes need explicit __init__ because the kw_only=True
+# dataclass decorator in transformers v5.5.3+ auto-generates __init__ for
+# subclasses, bypassing parent __init__ methods that set up attributes
+# (e.g. num_attention_heads, norm_topk_prob, rope_scaling) and convert
+# sub-config dicts to objects. Without these no-op forwarders, the assertion
+# `hasattr(config.text_config, "num_attention_heads")` in
+# `sglang/srt/utils/hf_transformers_utils.py:get_hf_text_config` fails because
+# the dataclass-generated __init__ never reaches `Qwen3NextConfig.__init__`
+# where the field is set. Mirrors the upstream sglang fix.
 class Qwen3_5MoeConfig(Qwen3_5Config):
     model_type = "qwen3_5_moe"
     sub_configs = {
         "vision_config": Qwen3_5MoeVisionConfig,
         "text_config": Qwen3_5MoeTextConfig,
     }
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
