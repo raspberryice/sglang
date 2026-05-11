@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+import zlib
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -32,6 +33,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import numpy as np
 import pybase64
 import uvloop
 import zmq
@@ -1594,7 +1596,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 routed_experts_tensor = recv_obj.routed_experts[i]
                 if routed_experts_tensor is not None:
                     meta_info["routed_experts"] = pybase64.b64encode(
-                        routed_experts_tensor.numpy().tobytes()
+                        zlib.compress(
+                            routed_experts_tensor.numpy().astype(np.int16).tobytes()
+                        )
                     ).decode("utf-8")
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
