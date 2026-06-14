@@ -951,9 +951,14 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    get_global_experts_capturer().capture(
+    capturer = get_global_experts_capturer()
+    capturer.capture(
         layer_id=layer_id,
         topk_ids=topk_ids,
+    )
+    capturer.capture_router_logits(
+        layer_id=layer_id,
+        router_logits=router_logits,
     )
     if _is_cuda:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)

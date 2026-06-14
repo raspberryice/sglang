@@ -1,4 +1,7 @@
+import atexit
 import logging
+import os
+import signal
 import zlib
 from abc import ABC
 from typing import Optional
@@ -116,7 +119,9 @@ class RoutedExpertsCapturer(ABC):
         max_running_requests: int,
         device: str,
     ):
-        if enable:
+        # Also enable the real capturer if the router-logits dump path is set,
+        # so analysis runs don't need --enable-return-routed-experts as well.
+        if enable or os.environ.get("SLIME_DUMP_ROUTER_LOGITS_DIR"):
             return _RoutedExpertsCapturerReal(
                 model_config,
                 num_tokens=num_tokens,
@@ -244,6 +249,99 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             staging_mb,
             pinned_mb,
         )
+
+        # Optional: also record full per-layer router_logits (fp16) for offline
+        # routing-stability analysis. Enabled by setting
+        # SLIME_DUMP_ROUTER_LOGITS_DIR. Reuses the existing copy-stream pipeline
+        # so capture stays cuda-graph-safe.
+        self._logits_device_cache = None
+        self._logits_host_buf = None
+        self._logits_dump_path = None
+        self._logits_chunk_idx = 0
+        dump_dir = os.environ.get("SLIME_DUMP_ROUTER_LOGITS_DIR")
+        if dump_dir:
+            num_experts = getattr(
+                model_config.hf_text_config, "num_experts", None
+            ) or getattr(model_config.hf_text_config, "n_routed_experts", None)
+            if num_experts is None:
+                logger.warning(
+                    "SLIME_DUMP_ROUTER_LOGITS_DIR=%s set but model_config exposes "
+                    "neither num_experts nor n_routed_experts; router-logits capture "
+                    "disabled.",
+                    dump_dir,
+                )
+            else:
+                max_batch = dev_buf.shape[0]
+                host_capacity = int(
+                    os.environ.get("SLIME_DUMP_ROUTER_LOGITS_CAPACITY", "20000")
+                )
+                self._logits_num_experts = int(num_experts)
+                self._logits_device_cache = torch.zeros(
+                    (max_batch, self.num_hidden_layers, self._logits_num_experts),
+                    dtype=torch.float16,
+                    device=device,
+                )
+                self._logits_staging = torch.zeros_like(self._logits_device_cache)
+                self._logits_pinned = torch.zeros(
+                    (max_batch, self.num_hidden_layers, self._logits_num_experts),
+                    dtype=torch.float16,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._logits_host_buf = torch.zeros(
+                    (host_capacity, self.num_hidden_layers, self._logits_num_experts),
+                    dtype=torch.float16,
+                    device="cpu",
+                )
+                self._logits_host_pos = 0
+                self._logits_capacity = host_capacity
+                rank = int(
+                    os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+                )
+                os.makedirs(dump_dir, exist_ok=True)
+                self._logits_dump_path = os.path.join(
+                    dump_dir,
+                    f"router_logits_rank{rank}_pid{os.getpid()}.pt",
+                )
+                dev_mb = (
+                    self._logits_device_cache.nelement()
+                    * self._logits_device_cache.element_size()
+                ) / _MB
+                host_mb = (
+                    self._logits_host_buf.nelement()
+                    * self._logits_host_buf.element_size()
+                ) / _MB
+                logger.info(
+                    "Router-logits capture enabled: max_batch=%d, layers=%d, "
+                    "experts=%d, host_capacity=%d, dev=%.1f MB host=%.1f MB, "
+                    "dump_path=%s",
+                    max_batch,
+                    self.num_hidden_layers,
+                    self._logits_num_experts,
+                    host_capacity,
+                    dev_mb,
+                    host_mb,
+                    self._logits_dump_path,
+                )
+                atexit.register(self.dump_router_logits)
+
+                # SIGTERM (Ray job stop / process.terminate) does not run atexit
+                # handlers by default. Install one that flushes the pending
+                # window before falling through to the default action.
+                def _term_dump(signum, frame, self=self):
+                    try:
+                        self.dump_router_logits()
+                    finally:
+                        signal.signal(signum, signal.SIG_DFL)
+                        os.kill(os.getpid(), signum)
+
+                try:
+                    signal.signal(signal.SIGTERM, _term_dump)
+                except (ValueError, OSError):
+                    # Not main thread (e.g. some sglang worker contexts) —
+                    # atexit alone will have to suffice. The auto-dump on
+                    # capacity-fill is the other safety net.
+                    pass
     def _sync_fwd_experts_buffer_DtoH(
         self,
         forward_batch: ForwardBatch,
@@ -281,6 +379,14 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._staging_buffer[:n_tok].copy_(
             self.device_cache.buffer[local_start_pos:local_end_pos]
         )
+        if self._logits_device_cache is not None:
+            # Mirror the topk_ids snapshot for the parallel router_logits buffer.
+            # Note: DeepEP path doesn't all-gather logits today — we capture only
+            # the local attn-TP slice. For analysis at scale this is acceptable
+            # (every rank sees a representative sample of tokens).
+            self._logits_staging[:n_tok].copy_(
+                self._logits_device_cache[local_start_pos:local_end_pos]
+            )
 
         # 2) On copy stream: async copies to pinned CPU buffers.
         with torch.cuda.stream(self._copy_stream):
@@ -291,6 +397,10 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             self._pinned_loc[:n_tok].copy_(
                 forward_batch.out_cache_loc, non_blocking=True
             )
+            if self._logits_device_cache is not None:
+                self._logits_pinned[:n_tok].copy_(
+                    self._logits_staging[:n_tok], non_blocking=True
+                )
 
         # 3) Record event — no sync, returns immediately.
         self._copy_event.record(self._copy_stream)
@@ -312,7 +422,79 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         topk = self.num_experts_per_tok
         loc = self._pinned_loc[:n]
         self.host_cache.buffer[loc] = self._pinned_staging[:n, :, :topk]
+        if self._logits_device_cache is not None:
+            # Append to the host ring buffer; when it fills, dump a chunk to
+            # disk and continue with the remainder so we don't drop tokens on
+            # long runs.
+            offset = 0
+            while offset < n:
+                remaining = self._logits_capacity - self._logits_host_pos
+                take = min(n - offset, remaining)
+                if take > 0:
+                    self._logits_host_buf[
+                        self._logits_host_pos : self._logits_host_pos + take
+                    ] = self._pinned_logits_view(offset, take)
+                    self._logits_host_pos += take
+                    offset += take
+                if self._logits_host_pos >= self._logits_capacity:
+                    # Dump-and-reset; pos goes back to 0 in dump_router_logits.
+                    self.dump_router_logits()
         self._pending_n = 0
+
+    def _pinned_logits_view(self, offset: int, take: int) -> torch.Tensor:
+        return self._logits_pinned[offset : offset + take]
+
+    def capture_router_logits(
+        self, layer_id: int, router_logits: torch.Tensor
+    ) -> None:
+        """Record raw router logits (pre-softmax) for offline analysis.
+
+        Mirrors :py:meth:`capture` for topk_ids. The capture point in topk.py
+        invokes us before logical-to-physical id remap, so columns are aligned
+        with the model's logical expert indices 0..num_experts-1.
+        """
+        if self._logits_device_cache is None:
+            return
+        batch = router_logits.shape[0]
+        # Pre-allocated fp16 device buffer; write the layer's row in place.
+        self._logits_device_cache[:batch, layer_id, :] = router_logits.to(
+            torch.float16
+        )
+
+    def dump_router_logits(self) -> Optional[str]:
+        """Flush the host ring buffer to disk. Idempotent / safe at atexit."""
+        if self._logits_host_buf is None or self._logits_dump_path is None:
+            return None
+        # Make sure any pending async copies have landed.
+        self._flush_pending_scatter()
+        n = self._logits_host_pos
+        if n == 0:
+            return None
+        payload = {
+            "router_logits": self._logits_host_buf[:n].clone(),
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_experts": self._logits_num_experts,
+            "captured_tokens": n,
+            "capacity": self._logits_capacity,
+        }
+        # Chunked output: a new file per dump call. Avoids overwriting on
+        # repeated triggers (atexit + future on-demand flushes).
+        path = self._logits_dump_path
+        if self._logits_chunk_idx > 0:
+            base, ext = os.path.splitext(path)
+            path = f"{base}_chunk{self._logits_chunk_idx}{ext}"
+        torch.save(payload, path)
+        logger.info(
+            "Router logits dumped: %d tokens x %d layers x %d experts -> %s",
+            n,
+            self.num_hidden_layers,
+            self._logits_num_experts,
+            path,
+        )
+        # Reset for the next chunk window.
+        self._logits_host_pos = 0
+        self._logits_chunk_idx += 1
+        return path
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         if get_moe_a2a_backend().is_deepep():
@@ -371,6 +553,14 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         pass
+
+    def capture_router_logits(
+        self, layer_id: int, router_logits: torch.Tensor
+    ) -> None:
+        pass
+
+    def dump_router_logits(self) -> Optional[str]:
+        return None
 
     def get_routed_experts(
         self,
