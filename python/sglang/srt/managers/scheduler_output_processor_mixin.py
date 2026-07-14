@@ -167,6 +167,11 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+                if logits_output.next_token_top_p_token_ids:
+                    logits_output.next_token_top_p_token_ids = [
+                        v.tolist() if torch.is_tensor(v) else v
+                        for v in logits_output.next_token_top_p_token_ids
+                    ]
 
             hidden_state_offset = 0
 
@@ -407,6 +412,11 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+                if logits_output.next_token_top_p_token_ids:
+                    logits_output.next_token_top_p_token_ids = [
+                        v.tolist() if torch.is_tensor(v) else v
+                        for v in logits_output.next_token_top_p_token_ids
+                    ]
         else:
             # for normal spec decoding: unify next_token_ids format
             next_token_ids = []
@@ -520,6 +530,15 @@ class SchedulerOutputProcessorMixin:
                         req.output_token_ids_logprobs_idx.append(
                             logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                         )
+                    if logits_output.next_token_top_p_token_ids:
+                        flat_idx = i * max_accept + j
+                        row_top_p_token_ids = logits_output.next_token_top_p_token_ids[
+                            flat_idx
+                        ]
+                        if row_top_p_token_ids is not None:
+                            if torch.is_tensor(row_top_p_token_ids):
+                                row_top_p_token_ids = row_top_p_token_ids.tolist()
+                            req.output_top_p_token_ids.append(row_top_p_token_ids)
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -872,6 +891,13 @@ class SchedulerOutputProcessorMixin:
                 output.next_token_token_ids_logprobs_idx[i]
             )
 
+        if output.next_token_top_p_token_ids:
+            row_top_p_token_ids = output.next_token_top_p_token_ids[i]
+            if row_top_p_token_ids is not None:
+                if torch.is_tensor(row_top_p_token_ids):
+                    row_top_p_token_ids = row_top_p_token_ids.tolist()
+                req.output_top_p_token_ids.append(row_top_p_token_ids)
+
         return num_input_logprobs
 
     def _initialize_empty_logprob_containers(self: Scheduler, req: Req) -> None:
@@ -970,6 +996,7 @@ class SchedulerOutputProcessorMixin:
             input_token_ids_logprobs_idx = []
             output_token_ids_logprobs_val = []
             output_token_ids_logprobs_idx = []
+            output_top_p_token_ids = []
         else:
             input_token_logprobs_val = input_token_logprobs_idx = (
                 output_token_logprobs_val
@@ -980,6 +1007,7 @@ class SchedulerOutputProcessorMixin:
             ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
                 output_token_ids_logprobs_idx
             ) = None
+            output_top_p_token_ids = None
 
         for req in reqs:
             if req is skip_req:
@@ -1119,6 +1147,12 @@ class SchedulerOutputProcessorMixin:
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
+                        if output_top_p_token_ids is not None:
+                            output_top_p_token_ids.append(
+                                (req.output_top_p_token_ids or [])[
+                                    send_output_token_logprobs_offset:logprob_end
+                                ]
+                            )
                         req.send_output_token_logprobs_offset = logprob_end
                     else:
                         output_token_logprobs_val.append([])
@@ -1127,6 +1161,8 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
+                        if output_top_p_token_ids is not None:
+                            output_top_p_token_ids.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
@@ -1189,6 +1225,7 @@ class SchedulerOutputProcessorMixin:
                     input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
                     output_token_ids_logprobs_val=output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
+                    output_top_p_token_ids=output_top_p_token_ids,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,

@@ -351,6 +351,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+            output_top_p_token_ids=recv_obj.output_top_p_token_ids,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=recv_obj.routed_experts,

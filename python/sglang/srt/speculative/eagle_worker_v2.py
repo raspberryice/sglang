@@ -22,7 +22,12 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import (
+    get_token_ids_logprobs,
+    get_top_logprobs,
+    get_top_p_token_ids_from_probs,
+    renorm_logprob_over_top_p,
+)
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -851,7 +856,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
-            self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
+            self._compute_spec_v2_logprobs(
+                batch, logits_output, predict, accept_index, accept_length
+            )
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
@@ -874,6 +881,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         logits_output: LogitsProcessorOutput,
         predict: torch.Tensor,
         accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
     ):
         """Compute logprobs for accepted tokens on GPU in the forward stream.
 
@@ -886,6 +894,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         flat_accept_idx = accept_index.long().reshape(-1)
         gathered_logits = logits_output.next_token_logits[flat_accept_idx]
+        temperatures = None
 
         if (
             batch.sampling_info.is_all_greedy
@@ -909,6 +918,82 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accepted_token_ids.long(),
         ]
         logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
+
+        if batch.sampling_info.need_return_top_p_token_ids:
+            valid_accept_mask = (
+                torch.arange(max_accept, device=device).view(1, -1)
+                < accept_lens.view(-1, 1)
+            ).reshape(-1)
+            request_mask = (
+                torch.repeat_interleave(
+                    batch.sampling_info.return_top_p_token_ids, max_accept
+                )
+                & valid_accept_mask
+            )
+
+            if batch.sampling_info.is_all_greedy:
+                logits_output.next_token_top_p_token_ids = [
+                    accepted_token_ids[i : i + 1].to(torch.int32)
+                    if bool(request_mask[i].item())
+                    else None
+                    for i in range(bs * max_accept)
+                ]
+            else:
+                if temperatures is None:
+                    temperatures = torch.repeat_interleave(
+                        batch.sampling_info.temperatures,
+                        max_accept,
+                        dim=0,
+                    )
+                probs = torch.softmax(gathered_logits / temperatures, dim=-1)
+                expanded_top_ks = torch.repeat_interleave(
+                    batch.sampling_info.top_ks, max_accept
+                )
+                expanded_top_ps = torch.repeat_interleave(
+                    batch.sampling_info.top_ps, max_accept
+                )
+                expanded_min_ps = torch.repeat_interleave(
+                    batch.sampling_info.min_ps, max_accept
+                )
+                top_p_token_ids = get_top_p_token_ids_from_probs(
+                    probs=probs,
+                    top_ks=expanded_top_ks,
+                    top_ps=expanded_top_ps,
+                    min_ps=expanded_min_ps,
+                    need_top_p_sampling=batch.sampling_info.need_top_p_sampling,
+                    need_min_p_sampling=False,
+                    request_mask=request_mask,
+                )
+                if top_p_token_ids is not None:
+                    logits_output.next_token_top_p_token_ids = top_p_token_ids
+
+                renorm_logprobs = renorm_logprob_over_top_p(
+                    probs=probs,
+                    top_ks=expanded_top_ks,
+                    top_ps=expanded_top_ps,
+                    min_ps=expanded_min_ps,
+                    need_top_p_sampling=batch.sampling_info.need_top_p_sampling,
+                    need_min_p_sampling=False,
+                    request_mask=request_mask,
+                    # Force-keep the accepted token: a small fraction of
+                    # speculatively accepted tokens land outside their own top-p
+                    # nucleus, which would give a -inf renormalized logprob.
+                    # Force-keeping makes the denominator ``nucleus ∪ {accepted}``,
+                    # matching the trainer which also force-keeps the target token,
+                    # so these tokens stay finite and on-policy.
+                    force_keep_token_ids=accepted_token_ids.long(),
+                )
+                if renorm_logprobs is not None:
+                    idx = torch.arange(bs * max_accept, device=device)
+                    renorm_token_logprobs = renorm_logprobs[
+                        idx, accepted_token_ids.long()
+                    ]
+                    renorm_token_logprobs.clamp_(
+                        min=torch.finfo(renorm_token_logprobs.dtype).min
+                    )
+                    logits_output.next_token_logprobs = renorm_token_logprobs.reshape(
+                        bs, max_accept
+                    )
 
         if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
             top_logprobs_nums_expanded = [

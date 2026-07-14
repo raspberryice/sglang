@@ -992,6 +992,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_top_p_token_ids: List[List[List[int]]]
     output_token_entropy_val: List[float]
 
     # Hidden states
@@ -1054,6 +1055,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_top_p_token_ids: List[List[List[int]]]
     output_token_entropy_val: List[float]
 
     # Hidden states

@@ -12,7 +12,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import (
+    get_token_ids_logprobs,
+    get_top_logprobs,
+    get_top_p_token_ids_from_probs,
+    renorm_logprob_over_top_p,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -105,6 +110,9 @@ class Sampler(nn.Module):
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
+            self._attach_greedy_top_p_token_ids_to_output(
+                logits_output, batch_next_token_ids, sampling_info
+            )
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
@@ -135,7 +143,11 @@ class Sampler(nn.Module):
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
                 batch_next_token_ids, logprobs = self._forward_ascend_backend(
-                    logits, sampling_info, simple_sampling_case, return_logprob
+                    logits_output,
+                    logits,
+                    sampling_info,
+                    simple_sampling_case,
+                    return_logprob,
                 )
             elif (
                 self.use_log_softmax_logprob
@@ -158,15 +170,45 @@ class Sampler(nn.Module):
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
 
+                self._attach_top_p_token_ids_to_output(
+                    logits_output,
+                    probs,
+                    sampling_info,
+                    simple_sampling_case,
+                )
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = (
-                        logprobs_via_logsoftmax_kernel
-                        if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
-                    )
+                    top_p_logprobs = None
+                    if sampling_info.need_return_top_p_token_ids:
+                        # Force-keep the sampled token in the renorm denominator:
+                        # SGLang samples with the flashinfer kernel but
+                        # renorm_logprob_over_top_p computes the nucleus with a
+                        # torch reimplementation. The two can disagree at the
+                        # nucleus boundary, so a sampled token may fall outside
+                        # the torch nucleus and get a -inf renormalized logprob
+                        # (-> NaN downstream). Force-keeping it makes the
+                        # denominator ``nucleus ∪ {sampled}``, matching the
+                        # trainer which also force-keeps the target token.
+                        top_p_logprobs = renorm_logprob_over_top_p(
+                            probs=probs,
+                            top_ks=sampling_info.top_ks,
+                            top_ps=sampling_info.top_ps,
+                            min_ps=sampling_info.min_ps,
+                            need_top_p_sampling=sampling_info.need_top_p_sampling,
+                            need_min_p_sampling=sampling_info.need_min_p_sampling,
+                            request_mask=sampling_info.return_top_p_token_ids,
+                            force_keep_token_ids=batch_next_token_ids,
+                        )
+                    if top_p_logprobs is not None:
+                        logprobs = top_p_logprobs
+                    else:
+                        logprobs = (
+                            logprobs_via_logsoftmax_kernel
+                            if logprobs_via_logsoftmax_kernel is not None
+                            else torch.log(probs)
+                        )
                 del probs
 
         # Attach logprobs to logits_output (in-place modification)
@@ -287,6 +329,7 @@ class Sampler(nn.Module):
 
     def _forward_ascend_backend(
         self,
+        logits_output: LogitsProcessorOutput,
         logits: torch.Tensor,
         sampling_info: SamplingBatchInfo,
         simple_sampling_case: bool,
@@ -302,6 +345,15 @@ class Sampler(nn.Module):
             when return_logprob is False or SGLANG_RETURN_ORIGINAL_LOGPROB is set.
         """
         logits.div_(sampling_info.temperatures)
+        if sampling_info.need_return_top_p_token_ids and not simple_sampling_case:
+            probs = torch.softmax(logits, dim=-1)
+            self._attach_top_p_token_ids_to_output(
+                logits_output,
+                probs,
+                sampling_info,
+                simple_sampling_case,
+            )
+            del probs
         batch_next_token_ids = self._sample_from_logits(
             logits, sampling_info, simple_sampling_case
         )
@@ -309,6 +361,49 @@ class Sampler(nn.Module):
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
             logprobs = torch.log_softmax(logits, dim=-1)
         return batch_next_token_ids, logprobs
+
+    def _attach_greedy_top_p_token_ids_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        batch_next_token_ids: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> None:
+        if not sampling_info.need_return_top_p_token_ids:
+            return
+
+        request_mask = sampling_info.return_top_p_token_ids
+        logits_output.next_token_top_p_token_ids = [
+            batch_next_token_ids[i : i + 1].to(torch.int32)
+            if bool(request_mask[i].item())
+            else None
+            for i in range(len(batch_next_token_ids))
+        ]
+
+    def _attach_top_p_token_ids_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        probs: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        simple_sampling_case: bool,
+    ) -> None:
+        if (
+            not sampling_info.need_return_top_p_token_ids
+            or sampling_info.return_top_p_token_ids is None
+            or simple_sampling_case
+        ):
+            return
+
+        top_p_token_ids = get_top_p_token_ids_from_probs(
+            probs=probs,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+            min_ps=sampling_info.min_ps,
+            need_top_p_sampling=sampling_info.need_top_p_sampling,
+            need_min_p_sampling=sampling_info.need_min_p_sampling,
+            request_mask=sampling_info.return_top_p_token_ids,
+        )
+        if top_p_token_ids is not None:
+            logits_output.next_token_top_p_token_ids = top_p_token_ids
 
     def _attach_logprobs_to_output(
         self,

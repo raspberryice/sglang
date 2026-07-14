@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -120,6 +121,110 @@ def get_top_logprobs(
         stage=LogprobStage.DECODE,
         no_copy_to_cpu=no_copy_to_cpu,
     )
+
+
+def _top_p_filter_rows(
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Rows that were requested AND actually have a top-k/top-p/min-p filter."""
+    row_has_filter = top_ks != TOP_K_ALL
+    if need_top_p_sampling:
+        row_has_filter = row_has_filter | (top_ps != 1.0)
+    if need_min_p_sampling:
+        row_has_filter = row_has_filter | (min_ps > 0)
+    return request_mask & row_has_filter
+
+
+def _top_p_keep_mask_sorted(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Boolean nucleus keep-mask in descending-prob order, plus the sort indices.
+
+    Reproduces SGLang's sampler truncation (rank < top_k, cumulative prob within
+    top_p, prob >= top1 * min_p) so replay sees the exact set the sampler keeps.
+    """
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    ranks = torch.arange(probs_sort.shape[-1], device=probs_sort.device).view(1, -1)
+    keep = ranks < top_ks.view(-1, 1)
+    if need_top_p_sampling:
+        keep &= (torch.cumsum(probs_sort, dim=-1) - probs_sort) <= top_ps.view(-1, 1)
+    if need_min_p_sampling:
+        keep &= probs_sort >= (probs_sort[:, 0] * min_ps).view(-1, 1)
+    return keep, probs_idx
+
+
+def renorm_logprob_over_top_p(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+    force_keep_token_ids: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    rows = _top_p_filter_rows(
+        top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+    )
+    if not bool(rows.any().item()):
+        return None
+
+    keep, probs_idx = _top_p_keep_mask_sorted(
+        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+    )
+    # Scatter the keep-mask back to vocab order so we renormalize directly over
+    # vocab ids (and can force-keep specific token ids).
+    keep_vocab = torch.empty_like(keep)
+    keep_vocab.scatter_(-1, probs_idx, keep)
+
+    if force_keep_token_ids is not None:
+        # Force-keep the sampled/accepted token so its renormalized logprob is
+        # finite even when SGLang's sampling kernel (e.g. flashinfer) keeps a
+        # boundary token that this torch nucleus drops. This matches the trainer,
+        # which also force-keeps the target token before renormalizing, so the
+        # rollout and training denominators are both ``nucleus ∪ {token}``.
+        # Non-filter rows are overwritten by the ``torch.where`` below, so
+        # force-keeping every row is harmless and avoids a row gather.
+        row_idx = torch.arange(keep_vocab.shape[0], device=keep_vocab.device)
+        keep_vocab[row_idx, force_keep_token_ids] = True
+
+    kept_probs = probs * keep_vocab
+    kept_probs = kept_probs / kept_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return torch.where(rows.view(-1, 1), torch.log(kept_probs), torch.log(probs))
+
+
+def get_top_p_token_ids_from_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+) -> Optional[List[Optional[torch.Tensor]]]:
+    rows = _top_p_filter_rows(
+        top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+    )
+    if not bool(rows.any().item()):
+        return None
+
+    keep, probs_idx = _top_p_keep_mask_sorted(
+        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+    )
+    return [
+        probs_idx[i][keep[i]].to(torch.int32) if bool(rows[i].item()) else None
+        for i in range(probs.shape[0])
+    ]
 
 
 def get_token_ids_logprobs_raw(

@@ -187,6 +187,9 @@ def _handle_output_by_index(output, i):
             output_token_ids_logprobs_idx=_extract_field_by_index(
                 output, "output_token_ids_logprobs_idx", i, check_length=False
             ),
+            output_top_p_token_ids=_extract_field_by_index(
+                output, "output_top_p_token_ids", i, check_length=False
+            ),
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
@@ -262,6 +265,9 @@ def _handle_output_by_index(output, i):
             ),
             output_token_ids_logprobs_idx=_extract_field_by_index(
                 output, "output_token_ids_logprobs_idx", i, check_length=False
+            ),
+            output_top_p_token_ids=_extract_field_by_index(
+                output, "output_top_p_token_ids", i, check_length=False
             ),
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False

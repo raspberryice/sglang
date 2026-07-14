@@ -960,6 +960,8 @@ class DecodeTransferQueue:
             output_token_logprobs_idx,
             output_top_logprobs_val,
             output_top_logprobs_idx,
+            output_top_p_token_ids_len,
+            output_top_p_token_ids,
             output_topk_p,
             output_topk_index,
             output_hidden_states,
@@ -1024,6 +1026,11 @@ class DecodeTransferQueue:
             decode_req.req.output_top_logprobs_idx.append(
                 output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
             )
+            top_p_token_ids_len = output_top_p_token_ids_len[0].item()
+            if top_p_token_ids_len > 0:
+                decode_req.req.output_top_p_token_ids.append(
+                    output_top_p_token_ids[:top_p_token_ids_len].tolist()
+                )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
