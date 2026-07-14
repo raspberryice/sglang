@@ -1325,7 +1325,11 @@ class _MegatronPlugin(_FrameworkPlugin):
     try:
         from megatron.core import parallel_state as _mpu
         from megatron.core.packed_seq_params import PackedSeqParams
-    except ImportError:
+    except Exception:
+        # ImportError when megatron is absent; PermissionError/OSError when its
+        # editable install points at a dir this process cannot read (e.g. a
+        # root-owned /root/Megatron-LM under a non-root SDB ssh user). Either
+        # way megatron is unusable here -> mark the plugin unavailable.
         _available = False
 
     @property

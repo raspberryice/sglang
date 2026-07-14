@@ -54,13 +54,15 @@ def main() -> int:
             "temperature": 1.0,
             "top_p": top_p,
             "max_new_tokens": 32,
+            # slime rollout opts the request in via custom_params inside the
+            # sampling params (Engine.generate has no custom_params kwarg; it
+            # lives on SamplingParams, matching sglang_rollout.py).
+            "custom_params": {"return_top_p_token_ids": True},
         }
         out = engine.generate(
             "Write one sentence about the ocean.",
             sampling_params,
             return_logprob=True,
-            # slime rollout sets this via custom_params to opt the request in.
-            custom_params={"return_top_p_token_ids": True},
         )
         meta = out["meta_info"]
 
