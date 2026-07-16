@@ -21,8 +21,9 @@ import unittest
 import torch
 
 from sglang.srt.layers.utils.logprob import (
-    _top_p_filter_rows,
+    _top_p_keep_mask_bounded,
     _top_p_keep_mask_sorted,
+    _top_p_filter_rows,
     get_top_p_token_ids_from_probs,
     renorm_logprob_over_top_p,
 )
@@ -236,6 +237,56 @@ class TestTopPReplayLogprob(unittest.TestCase):
             request_mask=request_mask,
         )
         self.assertIsNone(logp)
+
+    def _kept_ids_set(self, keep, probs_idx, row):
+        return set(int(x) for x in probs_idx[row][keep[row]].tolist())
+
+    def test_bounded_topk_equals_full_sort(self):
+        """The bounded `torch.topk` mask matches the full-sort mask exactly.
+
+        The decode-time speedup (PR #27408 structure): gathering only the top-K
+        candidates instead of a full-vocab sort must produce the identical kept
+        nucleus whenever the nucleus fits within K. vocab 200, K default 128 (>=
+        every nucleus at these top_p/top_k/min_p), random non-tied probs.
+        """
+        probs = _make_probs(6, 200, seed=11)
+        top_ps = [0.8, 0.9, 0.95, 0.99, 0.7, 0.5]
+        top_ks = [TOP_K_ALL, 50, TOP_K_ALL, 100, 30, TOP_K_ALL]
+        min_ps = [0.0, 0.0, 0.05, 0.0, 0.02, 0.0]
+        top_ks_t, top_ps_t, min_ps_t = self._params(6, top_ps, top_ks, min_ps)
+        common = dict(
+            top_ks=top_ks_t, top_ps=top_ps_t, min_ps=min_ps_t,
+            need_top_p_sampling=True, need_min_p_sampling=True,
+        )
+        keep_full, idx_full = _top_p_keep_mask_sorted(probs, **common)
+        keep_bnd, idx_bnd = _top_p_keep_mask_bounded(probs, **common)
+        for i in range(6):
+            self.assertEqual(
+                self._kept_ids_set(keep_bnd, idx_bnd, i),
+                self._kept_ids_set(keep_full, idx_full, i),
+                f"row {i}: bounded topk nucleus != full-sort nucleus",
+            )
+
+    def test_bounded_falls_back_when_nucleus_exceeds_k(self):
+        """A nucleus wider than K is recovered via the full-sort fallback.
+
+        Near-uniform probs over vocab 300 with a small explicit `mask_top_k=16`
+        forces the K-bound guard to fire; the recomputed nucleus must still equal
+        the full-sort nucleus (no silent truncation).
+        """
+        probs = torch.full((1, 300), 1.0 / 300.0)
+        top_ks_t, top_ps_t, min_ps_t = self._params(1, [0.9], [TOP_K_ALL], [0.0])
+        common = dict(
+            top_ks=top_ks_t, top_ps=top_ps_t, min_ps=min_ps_t,
+            need_top_p_sampling=True, need_min_p_sampling=False,
+        )
+        keep_full, idx_full = _top_p_keep_mask_sorted(probs, **common)
+        keep_bnd, idx_bnd = _top_p_keep_mask_bounded(probs, mask_top_k=16, **common)
+        full_set = self._kept_ids_set(keep_full, idx_full, 0)
+        bnd_set = self._kept_ids_set(keep_bnd, idx_bnd, 0)
+        # The nucleus is far wider than 16, so the guard must have engaged.
+        self.assertGreater(len(full_set), 16)
+        self.assertEqual(bnd_set, full_set, "K-bound fallback dropped nucleus tokens")
 
     def test_sampled_token_in_own_nucleus(self):
         """The token the sampler would draw is always inside the recorded set.

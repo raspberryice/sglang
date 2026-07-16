@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 from enum import Enum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -8,6 +9,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -140,6 +143,20 @@ def _top_p_filter_rows(
     return request_mask & row_has_filter
 
 
+# Default gather width for the top-p nucleus capture. `get_top_p_token_ids_from_probs`
+# only needs the KEPT nucleus (a prefix of the prob-sorted order), which is tiny in
+# practice (measured width p99 ~11 / max ~35 on Qwen3.6 codeforces rollouts), so we
+# bound the descending gather to the top-K with `torch.topk` instead of a full-vocab
+# `probs.sort` (~150k). This is the decode-time speedup (see
+# notes/training_logs/ioi/2026-07-16_qwen3_6_stage2_topp_mask_replay_observations.md):
+# it is decoupled from the sampling `top_k` on purpose, so it needs NO change to the
+# rollout recipe / `--rollout-top-k` and does NOT alter the sampling distribution — it
+# only bounds how many candidates the capture inspects. `_top_p_keep_mask_bounded`
+# falls back to the full sort for any row whose nucleus would exceed K (guarded), so
+# correctness never depends on K being large enough.
+MASK_TOPK_DEFAULT = 128
+
+
 def _top_p_keep_mask_sorted(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -163,6 +180,87 @@ def _top_p_keep_mask_sorted(
     return keep, probs_idx
 
 
+def _keep_mask_from_sorted(
+    probs_sort: torch.Tensor,
+    positions: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+) -> torch.Tensor:
+    """Nucleus keep-mask over an already descending-sorted prob tensor.
+
+    `positions` is the descending rank of each column (``arange(width)``); it is the
+    truncated width for the `torch.topk` path and the full vocab for the sort path.
+    Identical truncation rule as `_top_p_keep_mask_sorted` (rank < top_k, cumulative
+    prob within top_p, prob >= top1 * min_p).
+    """
+    keep = positions < top_ks.view(-1, 1)
+    if need_top_p_sampling:
+        keep &= (torch.cumsum(probs_sort, dim=-1) - probs_sort) <= top_ps.view(-1, 1)
+    if need_min_p_sampling:
+        keep &= probs_sort >= (probs_sort[:, 0] * min_ps).view(-1, 1)
+    return keep
+
+
+def _top_p_keep_mask_bounded(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    mask_top_k: int = MASK_TOPK_DEFAULT,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nucleus keep-mask + descending token ids, gathering only the top-`mask_top_k`.
+
+    Mirrors upstream sglang's `_compute_sampling_mask_from_probs` (PR #27408): use
+    `torch.topk(probs, k=mask_top_k)` instead of a full-vocab `probs.sort`, since the
+    kept nucleus is a small prefix of the descending order. Guards the K-bound: any
+    row whose nucleus reaches the K-th (last-gathered) column — i.e. the true nucleus
+    may extend past K — is recomputed with the full sort so the capture is never
+    silently truncated. Returns `(keep, probs_idx)` in the SAME descending-order
+    layout as `_top_p_keep_mask_sorted`, but width `K` (or full vocab on fallback).
+    """
+    vocab_size = probs.shape[-1]
+    k = int(mask_top_k)
+    if k <= 0 or k >= vocab_size:
+        # Nothing to bound — use the full sort directly.
+        return _top_p_keep_mask_sorted(
+            probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+        )
+
+    probs_sort, probs_idx = torch.topk(probs, k=k, dim=-1, largest=True, sorted=True)
+    positions = torch.arange(k, device=probs.device).view(1, -1)
+    keep = _keep_mask_from_sorted(
+        probs_sort, positions, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+    )
+
+    # Silent-truncation guard: if the last gathered column is still kept for a row,
+    # that row's nucleus might extend beyond K. Recompute ONLY those rows with the
+    # full-vocab sort and splice them in. Cheap in the common case (0 rows), correct
+    # in the rare wide-nucleus case. Single batched `.any()` sync (not per-row).
+    clipped = keep[:, -1]
+    if bool(clipped.any().item()):
+        full_keep, full_idx = _top_p_keep_mask_sorted(
+            probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+        )
+        logger.warning(
+            "top-p nucleus capture: %d row(s) hit the mask_top_k=%d gather bound; "
+            "recomputing them with the full sort (nucleus wider than K).",
+            int(clipped.sum().item()),
+            k,
+        )
+        # Pad the K-width tensors out to full vocab so we can index-assign clipped rows.
+        pad = vocab_size - k
+        keep = torch.nn.functional.pad(keep, (0, pad), value=False)
+        probs_idx = torch.nn.functional.pad(probs_idx, (0, pad), value=0)
+        keep[clipped] = full_keep[clipped]
+        probs_idx[clipped] = full_idx[clipped]
+    return keep, probs_idx
+
+
 def renorm_logprob_over_top_p(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -179,13 +277,20 @@ def renorm_logprob_over_top_p(
     if not bool(rows.any().item()):
         return None
 
-    keep, probs_idx = _top_p_keep_mask_sorted(
+    # Bounded gather instead of a full-vocab sort (same speedup as
+    # `get_top_p_token_ids_from_probs`; this renorm runs on the same per-decode-step
+    # hot path via the sampler). Falls back to full sort per row if a nucleus exceeds
+    # K (guarded in `_top_p_keep_mask_bounded`).
+    keep, probs_idx = _top_p_keep_mask_bounded(
         probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
     )
-    # Scatter the keep-mask back to vocab order so we renormalize directly over
-    # vocab ids (and can force-keep specific token ids).
-    keep_vocab = torch.empty_like(keep)
-    keep_vocab.scatter_(-1, probs_idx, keep)
+    # Build the vocab-order keep-mask by SETTING only the kept positions True (via a
+    # nonzero gather), never writing False. A plain `scatter_(probs_idx, keep)` would
+    # be unsafe here: `_top_p_keep_mask_bounded` pads unused columns with index 0, so a
+    # padded False could overwrite a genuinely-kept token at vocab id 0.
+    keep_vocab = torch.zeros_like(probs, dtype=torch.bool)
+    _fr, _fc = keep.nonzero(as_tuple=True)
+    keep_vocab[_fr, probs_idx[_fr, _fc]] = True
 
     if force_keep_token_ids is not None:
         # Force-keep the sampled/accepted token so its renormalized logprob is
@@ -218,13 +323,37 @@ def get_top_p_token_ids_from_probs(
     if not bool(rows.any().item()):
         return None
 
-    keep, probs_idx = _top_p_keep_mask_sorted(
+    # Bounded gather instead of a full-vocab sort (PR #27408 structure): the kept
+    # nucleus is a tiny prefix of the descending order, so `torch.topk(k=128)` avoids
+    # sorting ~150k entries every decode step. Falls back to full sort per row if a
+    # nucleus would exceed K (guarded inside `_top_p_keep_mask_bounded`).
+    keep, probs_idx = _top_p_keep_mask_bounded(
         probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
     )
-    return [
-        probs_idx[i][keep[i]].to(torch.int32) if bool(rows[i].item()) else None
-        for i in range(probs.shape[0])
-    ]
+    # Zero out rows we don't emit (not requested / no active filter) so the vectorized
+    # gather below never produces ids for them, then split the flat id stream back into
+    # per-row lists with a SINGLE batched device->host copy (no per-row `.item()` sync,
+    # which would serialize decode — the old hot path). Mirrors upstream
+    # `_attach_sampling_mask_to_output`.
+    keep = keep & rows.view(-1, 1)
+    flat_rows, flat_cols = keep.nonzero(as_tuple=True)
+    flat_ids = probs_idx[flat_rows, flat_cols].to(torch.int32)
+    row_lengths = keep.sum(dim=-1, dtype=torch.int64)
+
+    flat_ids_cpu = flat_ids.cpu()
+    row_lengths_cpu = row_lengths.cpu().tolist()
+    rows_cpu = rows.cpu().tolist()
+
+    out: List[Optional[torch.Tensor]] = []
+    cursor = 0
+    for i in range(probs.shape[0]):
+        n = int(row_lengths_cpu[i])
+        if rows_cpu[i]:
+            out.append(flat_ids_cpu[cursor : cursor + n])
+        else:
+            out.append(None)
+        cursor += n
+    return out
 
 
 def get_token_ids_logprobs_raw(
